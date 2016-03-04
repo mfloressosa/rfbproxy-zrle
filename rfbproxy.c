@@ -153,6 +153,32 @@ void vncEncryptBytes(char *, char *);
 # define INADDR_LOOPBACK ((in_addr_t) 0x7f000001)
 #endif
 
+#define min(a,b) \
+   ({ __typeof__ (a) _a = (a); \
+       __typeof__ (b) _b = (b); \
+     _a > _b ? _b : _a; })
+
+#define max(a,b) \
+   ({ __typeof__ (a) _a = (a); \
+       __typeof__ (b) _b = (b); \
+     _a > _b ? _a : _b; })
+	
+#include <assert.h>
+#include "zlib.h"
+
+#define CHUNK 16384
+
+/* Stream que se usa en la libreria de compresion zlib */
+static z_stream infstream;
+static int infstream_init = 0;
+
+/* Arrays globales donde se guardan temporalmente los pixeles antes de mandarlos al framebuffer (son dos y se usa uno el otro segun los bits por pixel) */
+char *zrleTilePixels8 = NULL;
+int *zrleTilePixels24 = NULL;
+int zrleTilePixels8_len = 0;
+int zrleTilePixels24_len = 0;
+
+
 static int verbose = 0;
 
 /* struct pixel - holds one pixel in PPM format */
@@ -177,8 +203,7 @@ struct FramebufferFormat {
 
 /* decode the network format in 'buf' and store it in 'fbf' */
 
-void decode_PixelFormat (unsigned char *buf,
-			 struct FramebufferFormat *fbf)
+void decode_PixelFormat(unsigned char *buf, struct FramebufferFormat *fbf)
 {
 	fbf->bits_per_pixel = buf[0];
 	fbf->bytes_per_pixel = fbf->bits_per_pixel / 8;
@@ -189,9 +214,11 @@ void decode_PixelFormat (unsigned char *buf,
 	memcpy (&fbf->red_max, buf+4, 2);
 	memcpy (&fbf->green_max, buf+6, 2);
 	memcpy (&fbf->blue_max, buf+8, 2);
+	
 	fbf->red_max = ntohs(fbf->red_max);
 	fbf->green_max = ntohs(fbf->green_max);
 	fbf->blue_max = ntohs(fbf->blue_max);
+	
 	for (fbf->red_bits = 1; (1 << fbf->red_bits) < fbf->red_max; )
 		fbf->red_bits ++;
 	for (fbf->green_bits = 1; (1 << fbf->green_bits) < fbf->green_max; )
@@ -204,8 +231,7 @@ void decode_PixelFormat (unsigned char *buf,
 	fbf->blue_shift=buf[12];
 }
 
-void decode_FramebufferFormat (unsigned char *buf,
-			       struct FramebufferFormat *fbf)
+void decode_FramebufferFormat(unsigned char *buf, struct FramebufferFormat *fbf)
 {
 	memcpy (&fbf->width, buf, 2);
 	memcpy (&fbf->height, buf+2, 2);
@@ -217,8 +243,7 @@ void decode_FramebufferFormat (unsigned char *buf,
 
 /* encode the format in 'fbf' into 20-byte, network-ready 'buf' */
 
-void encode_FramebufferFormat (unsigned char *buf,
-			       struct FramebufferFormat *fbf)
+void encode_FramebufferFormat(unsigned char *buf, struct FramebufferFormat *fbf)
 {
 	uint16_t val;
 
@@ -253,13 +278,13 @@ void encode_FramebufferFormat (unsigned char *buf,
 void print_FramebufferFormat(FILE *file, struct FramebufferFormat *format)
 {
 	fprintf(file, "%dx%dx%d %s endian %s RFB session\n",
-		format->width, format->height, format->bits_per_pixel,
+		(int)format->width, (int)format->height, (int)format->bits_per_pixel,
 		format->big_endian ? "big" : "little",
 		format->true_color ? "true color" : "colormap");
-	fprintf(file, "red %x/%d, green %x/%d, blue %x/%d\n",
-		format->red_max, format->red_shift,
-		format->green_max, format->green_shift,
-		format->blue_max, format->blue_shift);
+	fprintf(file, "red %d/%d, green %d/%d, blue %d/%d\n",
+		(int)format->red_max, (int)format->red_shift,
+		(int)format->green_max, (int)format->green_shift,
+		(int)format->blue_max, (int)format->blue_shift);
 }
 
 /********** read/write UTILITY FUNCTIONS **********/
@@ -280,6 +305,7 @@ static ssize_t do_write (int fd, const void *buf, size_t len)
 		buf += wrote;
 		len -= wrote;
 	}
+	
 	return len;
 }
 
@@ -340,6 +366,12 @@ typedef struct fbs_fileptr {
 	unsigned long ms;
 } FBSfile;
 
+
+typedef struct zrle_stream {
+	char *pos;
+	unsigned int len;
+} ZRLEStream;
+
 /* next_packet() advances to the next FBS packet in the input steam
  *
  * We really don't have to consider read errors, since we've mmap()'ed
@@ -384,7 +416,7 @@ static void next_packet(FBSfile *file) {
 		file->len = 0;
 		return;
 	}
-
+	
 	/* delay from start of capture in milliseconds */
 
 	bit32 = (uint32_t *) (4 + file->next_packet
@@ -399,8 +431,8 @@ static void next_packet(FBSfile *file) {
 
 	if (verbose >= 3) {
 		fprintf(stderr, "next_packet(): offset=%d len=%d ms=%ld\n",
-			file->buf - file->map, file->len, file->ms);
-	}
+			(int)(file->buf - file->map), (int)file->len, file->ms);
+	}	
 }
 
 static void FBSclose(FBSfile *file)
@@ -438,7 +470,7 @@ static int FBSopen (const char *filename, FBSfile *fileptr)
 
 	close (fd);
 
-	if (strncmp (fileptr->map, "FBS 001.", 8) != 0) {
+	if (strncmp ((char*)fileptr->map, "FBS 001.", 8) != 0) {
 		fprintf (stderr, "%s: Incorrect FBS version\n", filename);
 		FBSclose(fileptr);
 		return -1;
@@ -485,7 +517,7 @@ void get_bytes(FBSfile *file, void *dest, int bytes)
 	 * next packet's timestamp.  This causes a series of frames to
 	 * be exported before we begin processing the next packet.
 	 */
-
+	
 	while ((bytes >= file->len) && !fbs_at_eof(file)) {
 		bytes -= file->len;
 		if (dest) {
@@ -494,7 +526,7 @@ void get_bytes(FBSfile *file, void *dest, int bytes)
 		}
 		next_packet(file);
 	}
-
+	
 	if (bytes > 0) {
 		if (fbs_at_eof(file)) {
 			if (dest) bzero(dest, bytes);
@@ -531,38 +563,38 @@ uint32_t get_long(FBSfile *file) {
  * here (i.e, the pixel will fit into a uint32_t)
  */
 
-void get_pixel(FBSfile *file, struct FramebufferFormat *format,
-	       struct pixel *pptr) {
-
-	unsigned char buf[4];
+void get_pixel(FBSfile *file, struct FramebufferFormat *format, struct pixel *pptr)
+{
+	uint32_t rawpixel = 0, pixel;
+	unsigned char byteArrayPixel[4];
 	int i;
-	uint32_t rawpixel=0, pixel;
-
-	get_bytes(file, buf, format->bytes_per_pixel);
-
+	
+	get_bytes(file, byteArrayPixel, format->bytes_per_pixel);
+	
 	if (format->big_endian) {
 		for (i = 0; i < format->bytes_per_pixel; i++) {
 			rawpixel <<= 8;
-			rawpixel |= buf[i];
-		}
-	} else {
-		for (i = 0; i < format->bytes_per_pixel; i++) {
-			rawpixel |= buf[i] << (8*i);
+			rawpixel |= byteArrayPixel[i];
 		}
 	}
-
+	else {
+		for (i = 0; i < format->bytes_per_pixel; i++) {
+			rawpixel |= byteArrayPixel[i] << (8 * i);
+		}
+	}
+	
 	pixel = rawpixel;
 	pixel >>= format->red_shift;
 	pixel &= format->red_max;
 	pixel <<= (8 - format->red_bits);
 	pptr->red = (unsigned char) pixel;
-
+	
 	pixel = rawpixel;
 	pixel >>= format->green_shift;
 	pixel &= format->green_max;
 	pixel <<= (8 - format->green_bits);
 	pptr->green = (unsigned char) pixel;
-
+	
 	pixel = rawpixel;
 	pixel >>= format->blue_shift;
 	pixel &= format->blue_max;
@@ -570,9 +602,47 @@ void get_pixel(FBSfile *file, struct FramebufferFormat *format,
 	pptr->blue = (unsigned char) pixel;
 }
 
-static int get_initial_RFB_handshake(FBSfile *file,
-				     struct FramebufferFormat *format)
+
+void create_pixel(uint32_t intPixel, struct FramebufferFormat *format, struct pixel *pptr)
 {
+    uint32_t rawpixel = 0, pixel;
+	int i;
+	
+    /* Si el formato es big endian tengo que dar vuelta los bytes del pixel */
+	if (format->big_endian) {
+		unsigned char *byteArrayPixel = (unsigned char*)&intPixel;
+		for (i = 0; i < format->bytes_per_pixel; i++) {
+			rawpixel <<= 8;
+			rawpixel |= byteArrayPixel[i];
+		}
+	}
+	else {
+		rawpixel = intPixel;
+	}
+	
+	pixel = rawpixel;
+	pixel >>= format->red_shift;
+	pixel &= format->red_max;
+	pixel <<= (8 - format->red_bits);
+	pptr->red = (unsigned char) pixel;
+	
+	pixel = rawpixel;
+	pixel >>= format->green_shift;
+	pixel &= format->green_max;
+	pixel <<= (8 - format->green_bits);
+	pptr->green = (unsigned char) pixel;
+	
+	pixel = rawpixel;
+	pixel >>= format->blue_shift;
+	pixel &= format->blue_max;
+	pixel <<= (8 - format->blue_bits);
+	pptr->blue = (unsigned char) pixel;
+}
+
+static int get_initial_RFB_handshake(FBSfile *file, struct FramebufferFormat *format)
+{
+	if (verbose > 2) fprintf(stderr, "Procesando Handshake RFB\n");
+	
 	int minor_protocol_version;
 	char buffer[32];
 	int auth;
@@ -590,7 +660,6 @@ static int get_initial_RFB_handshake(FBSfile *file,
 	if (minor_protocol_version == 3) {
 
 		/* The authentication scheme */
-
 		auth = get_long(file);
 
 		if (auth == 0) {
@@ -626,7 +695,8 @@ static int get_initial_RFB_handshake(FBSfile *file,
 			return -1;
 		}
 
-	} else {
+	}
+	else {
 
 		int num_security_types = get_uchar(file);
 
@@ -641,10 +711,13 @@ static int get_initial_RFB_handshake(FBSfile *file,
 		 */
 	}
 
-	/* ServerInitialisation */
+	/* MAXI: Agrego un next_packet que en original no estaba, para que no me queden desfazados los bytes que se leen a continuacion. */
+	next_packet(file);
 
+	/* ServerInitialisation */
 	get_bytes(file, &buffer, 20);
-	decode_FramebufferFormat(buffer, format);
+
+	decode_FramebufferFormat((unsigned char*)buffer, format);
 
 	if (verbose > 0) {
 		fprintf(stderr, "file uses format:\n");
@@ -652,10 +725,9 @@ static int get_initial_RFB_handshake(FBSfile *file,
 	}
 
 	/* name of desktop */
-
 	length = get_long(file);
 	get_bytes(file, NULL, length);
-
+	
 	return 0;
 }
 
@@ -675,8 +747,7 @@ int fput_long(uint32_t val, FILE *file)
 
 /* just like get_pixel, we assume the pixel will fit into 32 bits */
 
-int fput_pixel(struct pixel *pptr, struct FramebufferFormat *format,
-	       FILE *file)
+int fput_pixel(struct pixel *pptr, struct FramebufferFormat *format, FILE *file)
 {
 	uint32_t pixel;
 	int ret;
@@ -726,18 +797,18 @@ int fput_pixel(struct pixel *pptr, struct FramebufferFormat *format,
  */
 
 static int do_passthrough_authentication (int server, int clientr, int clientw,
-					  FILE *f, int do_events_instead,
-					  struct FramebufferFormat *fbf)
+										  FILE *f, int do_events_instead,
+										  struct FramebufferFormat *fbf)
 {
 	char packet[24];
 	size_t packet_size;
 	struct timeval start;
 	uint32_t auth;
 	int protocol_minor_version;
-
+	
 	start.tv_sec = 0;
 	start.tv_usec = 0;
-
+	
 	/* ProtocolVersion */
 	if (do_read (server, packet, 12)) {
 		fprintf(stderr, "Can't read server ProtocolVersion\n");
@@ -757,13 +828,13 @@ static int do_passthrough_authentication (int server, int clientr, int clientw,
 	if (protocol_minor_version >= 7) {
 		packet_size = 1;
 	}
-
+	
 	/* Authentication */
 	if (do_read (server, packet, packet_size)) {
 		fprintf(stderr, "Can't read server authentication start\n");
 		return 1;
 	}
-
+	
 	if (protocol_minor_version == 3) {
 		uint32_t noauth = htonl (1);
 		do_write (clientw, packet, 4);
@@ -809,12 +880,12 @@ static int do_passthrough_authentication (int server, int clientr, int clientw,
 			write_packet (f, packet, 2, &start);
 		}
 	}
-
+	
 	/* auth type 0 (authentication failed) can be ignored,
 	 * and auth type 1 (no authentication) just skips ahead
 	 * in pre-3.8 protocol versions.
 	 */
-
+	
 	if ((auth == 1) && (protocol_minor_version >= 8)) {
 		if (do_read (server, packet, 4)) {
 			fprintf(stderr, "Can't read server auth response\n");
@@ -822,7 +893,7 @@ static int do_passthrough_authentication (int server, int clientr, int clientw,
 		}
 		do_write (clientw, packet, 4);
 	}
-
+	
 	if (auth == 2) {
 		/* Don't record this stuff. */
 		if (do_read (server, packet, 16)) {
@@ -841,19 +912,19 @@ static int do_passthrough_authentication (int server, int clientr, int clientw,
 		}
 		do_write (clientw, packet, 4);
 	}
-
+	
 	if (auth > 2) {
 		fprintf(stderr, "Authentication type %d not understood\n",
 			auth);
 	}
-
+	
 	/* ClientInitialisation */
 	if (do_read (clientr, packet, 1)) {
 		fprintf(stderr, "Can't read client shared-session flag\n");
 		return 1;
 	}
 	do_write (server, packet, 1);
-
+	
 	/* ServerInitialisation */
 	if (do_read (server, packet, 24)) {
 		fprintf(stderr, "Can't read ServerInitialization\n");
@@ -861,11 +932,11 @@ static int do_passthrough_authentication (int server, int clientr, int clientw,
 	} else {
 		uint32_t name_length;
 		char *buffer;
-
+		
 		if (fbf != NULL) {
-			decode_FramebufferFormat(packet, fbf);
+			decode_FramebufferFormat((unsigned char*)packet, fbf);
 		}
-
+		
 		memcpy (&name_length, packet + 20, 4);
 		name_length = ntohl (name_length);
 		buffer = malloc (name_length);
@@ -888,7 +959,7 @@ static int do_passthrough_authentication (int server, int clientr, int clientw,
 		}
 		free (buffer);
 	}
-
+	
 	return 0;
 }
 
@@ -898,8 +969,7 @@ static int do_passthrough_authentication (int server, int clientr, int clientw,
  * The FBS log file is 'f' and the server's default format is written to 'fbf'
  */
 
-static int do_standalone_authentication (int server, FILE *f,
-					 struct FramebufferFormat * fbf)
+static int do_standalone_authentication (int server, FILE *f, struct FramebufferFormat * fbf)
 {
 	char packet[24];
 	size_t packet_size;
@@ -1012,7 +1082,7 @@ static int do_standalone_authentication (int server, FILE *f,
 		char *buffer;
 
 		if (fbf != NULL) {
-			decode_FramebufferFormat(packet, fbf);
+			decode_FramebufferFormat((unsigned char*)packet, fbf);
 		}
 
 		memcpy (&name_length, packet + 20, 4);
@@ -1065,7 +1135,7 @@ static int do_server_initialization (int clientr, int clientw,
 	 * integer indicating a zero length name string
 	 */
 	bzero(packet, 24);
-	encode_FramebufferFormat(packet, fbf);
+	encode_FramebufferFormat((unsigned char*)packet, fbf);
 	do_write (clientw, packet, 24);
 
 	return 0;
@@ -1445,7 +1515,8 @@ static int record (const char *file, int clientr, int clientw,
 
 		if (FD_ISSET (server, &rfds)) {
 
-			gettimeofday (&tv, &tz);
+			gettimeofday(&tv, &tz);
+			gettimeofday(&epoch, &tz);
 			if (first) {
 				first = 0;
 				epoch = tv;
@@ -1683,7 +1754,7 @@ static int handle_client_during_playback (int clientr, int cycle, int pause,
 		
 		if (client_buffer[0] == 0) {
 			/* SetPixelFormat */
-			decode_PixelFormat(client_buffer + 4, fbf);
+			decode_PixelFormat((unsigned char*)client_buffer + 4, fbf);
 			if (verbose > 0) {
 				fprintf(stderr, "client SetPixelFormat:\n");
 				print_FramebufferFormat(stderr, fbf);
@@ -1938,7 +2009,7 @@ static int playback (const char *filename, int clientr, int clientw, int loop,
 		FBSclose(&fileptr);
 		return -1;
 	}
-
+	
 	if (!loop) {
 		do_server_initialization(clientr, clientw, &server_fbf);
 		client_fbf = server_fbf;
@@ -2139,7 +2210,7 @@ static int playback (const char *filename, int clientr, int clientw, int loop,
  * converting everytime we write.
  */
 
-struct pixel *framebuffer=NULL;
+struct pixel *framebuffer = NULL;
 
 /* This function outputs the framebuffer as a PPM.  If outfilename is
  * NULL, we append to stdout.  Maybe I should fix this to use
@@ -2151,7 +2222,7 @@ static int write_framebuffer_as_ppm (char *outfilename,
 				     struct FramebufferFormat *fbf) {
 
 	FILE * outfile;
-
+	
 	if (outfilename != NULL) {
 		outfile = fopen(outfilename, "wb");
 		if (!outfile) { perror("fopen"); return -1; }
@@ -2161,12 +2232,12 @@ static int write_framebuffer_as_ppm (char *outfilename,
 
 	fprintf(outfile, "P6 %d %d 255\n", fbf->width, fbf->height);
 	fflush(outfile);
-
+	
 	do_write (fileno(outfile), framebuffer,
 		  fbf->width * fbf->height * sizeof(struct pixel));
-
+		  
 	if (outfilename != NULL) fclose(outfile);
-
+	
 	return 0;
 }
 
@@ -2244,9 +2315,446 @@ struct framerate preset_framerates[] = {
  * those that write into the framebuffer and those that read from the
  * recorded RFB session.
  */
+ 
+/* MAXI: Funciones nuevas para manejar caso de encoding ZRLE */
+
+/* Lee un unico pixel del stream ZRLE y lo devuelve en representacion de enetero (4 bytes) */
+static int read_zrle_pixel(ZRLEStream *zrle, struct FramebufferFormat *format)
+{
+	int n = 0;
+	
+	if (format->bytes_per_pixel == 1) {
+		/* Leo el 1er dato del pixel desde el stream ZRLE */
+		memcpy(&n, zrle->pos, 1);
+		zrle->pos += 1;
+		zrle->len -= 1;
+	} else {
+		/* Leo el 2do dato del pixel desde el stream ZRLE */
+		int n2 = 0;
+		memcpy(&n2, zrle->pos, 1);
+		zrle->pos += 1;
+		zrle->len -= 1;
+		/* Leo el 3er dato del pixel desde el stream ZRLE */
+		int n3 = 0;
+		memcpy(&n3, zrle->pos, 1);
+		zrle->pos += 1;
+		zrle->len -= 1;
+		/* Leo el 4to dato del pixel desde el stream ZRLE */
+		int n4 = 0;
+		memcpy(&n4, zrle->pos, 1);
+		zrle->pos += 1;
+		zrle->len -= 1;
+		/* Combino los 4 datos */
+		n = ( (n4 & 255) << 16 ) | ( (n3 & 255) << 8 ) | ( n2 & 255 );
+	}
+	
+	return n;
+}
+
+/* Lee [size] pixeles del stream ZRLE y lo carga en buffer */
+static void read_zrle_pixels(ZRLEStream *zrle, struct FramebufferFormat *format, int *buffer, unsigned int size)
+{
+	if (format->bytes_per_pixel == 1) {
+		
+		int tempPixeles[size];
+		
+		memcpy(&tempPixeles, zrle->pos, size);
+		zrle->pos += size;
+		zrle->len -= size;
+		
+		int m;
+		for (m = 0; m < size; ++m) {
+			buffer[m] = tempPixeles[m] & 255;
+		}
+	}
+	else {
+		char tempPixeles[size * 3];
+		
+		memcpy(&tempPixeles, zrle->pos, size * 3);
+		zrle->pos += (size * 3);
+		zrle->len -= (size * 3);
+		
+		int m;
+		for (m = 0; m < size; ++m) {
+                    buffer[m] = ( ((tempPixeles[m * 3 + 2] & 255) << 16)
+                                | ((tempPixeles[m * 3 + 1] & 255) << 8)
+                                | (tempPixeles[m * 3]  & 255)
+                                );
+		}
+	}
+}
+
+/* Decodifica un tile de pixeles codificados en 'Raw pixel data' y lo carga en el array de pixeles correspondiente */
+static void read_zrle_raw_pixels(ZRLEStream *zrle, struct FramebufferFormat *format, int w, int h)
+{
+	/* No estoy seguro si esto es diferente a hacerlo directamente con read_zrle_pixels... No lo pude probar, asi que lo dejo asi  */
+	if (format->bytes_per_pixel == 1) {
+		
+		memcpy(&zrleTilePixels8, zrle->pos, w * h);
+		zrle->pos += (w * h);
+		zrle->len -= (w * h);
+	}
+	else {
+		read_zrle_pixels(zrle, format, zrleTilePixels24, w * h);
+	}
+}
+
+/* Decodifica un tile de pixeles codificados en 'Packed palette types' y lo carga en el array de pixeles correspondiente */
+static void read_zrle_packed_pixels(ZRLEStream *zrle, struct FramebufferFormat *format, int w, int h, int *buffer, unsigned int size)
+{
+	/* Packed palette types. Followed by the palette, consisting of paletteSize(=
+	 * subencoding) pixel values. Then the packed pixels follow, each pixel represented
+	 * as a bit field yielding an index into the palette (0 meaning the first palette
+	 * entry). For paletteSize 2, a 1-bit field is used, for paletteSize 3 or 4 a 2-bit
+	 * field is used and for paletteSize from 5 to 16 a 4-bit field is used. The bit fields
+	 * are packed into bytes, the most significant bits representing the leftmost pixel
+	 * (i.e. big endian). For tiles not a multiple of 8, 4 or 2 pixels wide (as appropriate),
+	 * padding bits are used to align each row to an exact number of bytes.
+	 */
+	 
+	int n4 = size > 16 ? 8 : (size > 4 ? 4 : (size > 2 ? 2 : 1));
+	int n5 = 0;
+	int i;
+	
+	for (i = 0; i < h; ++i) {
+		
+		int n6 = n5 + w;
+		int n7 = 0;
+		int n8 = 0;
+		
+		while (n5 < n6) {
+			
+			if (n8 == 0) {
+				
+				memcpy(&n7, zrle->pos, 1);
+				zrle->pos += 1;
+				zrle->len -= 1;
+				
+				n8 = 8;
+			}
+			
+			int n9 = ( n7 >> (n8-=n4) ) & ( (1 << n4) - 1 ) & ( 127 );
+			
+			if (format->bytes_per_pixel == 1) {
+				zrleTilePixels8[n5++] = (char)buffer[n9];
+				continue;
+			}
+			zrleTilePixels24[n5++] = buffer[n9];
+		}
+	}
+}
+
+/* Decodifica un tile de pixeles codificados en 'Plain RLE' y lo carga en el array de pixeles correspondiente */
+static void read_zrle_plain_rle_pixels(ZRLEStream *zrle, struct FramebufferFormat *format, int w, int h)
+{
+	/*  Plain RLE. Consists of a number of runs, repeated until the tile is done. Runs
+	 * may continue from the end of one row to the beginning of the next. Each run
+	 * is a represented by a single pixel value followed by the length of the run. The
+	 * length is represented as one or more bytes. The length is calculated as one more
+	 * than the sum of all the bytes representing the length. Any byte value other than
+	 * 255 indicates the final byte. So for example length 1 is represented as [0], 255
+	 * as [254], 256 as [255,0], 257 as [255,1], 510 as [255,254], 511 as [255,255,0]
+	 * and so on.
+	 */
+	 
+	int ptr = 0;
+	int end = ptr + (w * h);
+	
+	while (ptr < end) {
+		
+		int tempLen = 0;
+        int rawpixel = read_zrle_pixel(zrle, format);
+		int len = 1;
+		
+		do {
+			memcpy(&tempLen, zrle->pos, 1);
+			zrle->pos += 1;
+			zrle->len -= 1;
+			len+=tempLen;
+		} while (tempLen == 255);
+		
+		if (len > end - ptr) {
+			fprintf(stderr, "ERROR --> ZRLE decoder: assertion failed (len <= end - ptr))\n");
+			exit(EXIT_FAILURE);
+		}
+                
+		if (format->bytes_per_pixel == 1) {
+			while (len-- > 0) {
+				zrleTilePixels8[ptr++] = (char)rawpixel;
+			}
+			continue;
+		}
+		while (len-- > 0) {
+			zrleTilePixels24[ptr++] = rawpixel;
+		}
+	}
+}
+
+/* Decodifica un tile de pixeles codificados en 'Palette RLE' y lo carga en el array de pixeles correspondiente */
+static void read_zrle_packed_rle_pixels(ZRLEStream *zrle, struct FramebufferFormat *format, int w, int h, int *buffer)
+{
+	int ptr = 0;
+	int end = ptr + w * h;
+	
+	while (ptr < end) {
+		
+		int n5 = 0;
+		int n6 = 0;
+		
+		memcpy(&n6, zrle->pos, 1);
+		zrle->pos += 1;
+		zrle->len -= 1;
+		
+		int len = 1;
+		
+		if ((n6 & 128) != 0) {
+			do {
+				memcpy(&n5, zrle->pos, 1);
+				zrle->pos += 1;
+				zrle->len -= 1;
+				
+				len+=n5;
+				
+			} while (n5 == 255);
+			
+			if (len > end - ptr) {
+				fprintf(stderr, "ERROR --> ZRLE decoder: assertion failed (len <= end - ptr)\n");
+				exit(EXIT_FAILURE);
+			}
+		}
+		
+        n6 = n6 & 127;
+		n5 = buffer[n6];
+		
+		if (format->bytes_per_pixel == 1) {
+			while (len-- > 0) {
+				zrleTilePixels8[ptr++] = (char)n5;
+			}
+			continue;
+		}
+		
+		while (len-- > 0) {
+			zrleTilePixels24[ptr++] = n5;
+		}
+	}
+}
+
+
+/* Funcion que recorre lo que se cargo anteriormente en los arrays, lo convierte a pixeles y se lo manda al framebuffer */
+static void handle_updated_zrle_tile(ZRLEStream *zrle, struct FramebufferFormat *format, int x, int y, int w, int h)
+{
+	if (verbose > 4) fprintf(stderr, "Enviando pixeles obtenidos al framebuffer\n");
+	
+	struct pixel pix;
+	int i, j;
+	
+	/* Segun el caso (pixel de 8 bits o mas) uso diferentes arrays */
+	if (format->bytes_per_pixel == 1) {
+		
+		/* Voy recorriendo el array de pixeles que quedo despues del decode. Primero las filas entre 0 y height */
+		for (i = 0; i < h; i++) {
+			/* Dentro de cada fila los pixeles entre 0 y width */
+			for (j = 0; j < w; j++) {
+				/* Para cada posicion dentro del tile, obtengo los datos del pixel y se los mando al framebuffer */
+				create_pixel((uint32_t)zrleTilePixels8[i * w + j], format, &pix);
+				set_pixel(framebuffer, format, x + j, y + i, &pix);
+			}
+		}
+	}
+	else {
+		
+		/* Voy recorriendo el array de pixeles que quedo despues del decode. Primero las filas entre 0 y height */
+		for (i = 0; i < h; i++) {
+			/* Dentro de cada fila los pixeles entre 0 y width */
+			for (j = 0; j < w; j++) {
+				/* Para cada posicion dentro del tile, obtengo los datos del pixel y se los mando al framebuffer */
+				create_pixel((uint32_t)zrleTilePixels24[i * w + j], format, &pix);
+				set_pixel(framebuffer, format, x + j, y + i, &pix);
+			}
+		}
+	}
+}
+
+
+/* Funcion que procesa un 'rect' (una matriz de 'tiles') ZRLE, los descomprime, decodea y envia al framebuffer */
+static void process_zrle(FBSfile *file, struct FramebufferFormat *format,
+                        int rectx, int recty, int rectw, int recth) {
+
+	int ret;
+    unsigned int have;
+	char out[CHUNK];
+	
+	/* Obtengo tamaño del mensaje comprimido a procesar */
+	unsigned int zrle_compressed_len = get_long(file);
+	
+	if (verbose > 2) fprintf(stderr, "Procesando rect de '%dx%d' en la posicion '%dx%d' (mensaje comprimido --> %d bytes)\n", rectw, recth, rectx, recty, zrle_compressed_len);
+	
+	/* Defino los buffer donde voy a guardar el stream ZRLE comprimido y descomprimido */
+	char zrle_compressed_buf[zrle_compressed_len];
+	
+	/* Cargo la entrada comprimida en el buffer, leyendola desde la entranda */
+	get_bytes(file, zrle_compressed_buf, zrle_compressed_len);
+	
+	/* La primera vez el puntero esta sin inicializar y hay que hacer el inflateInit */
+	if (infstream_init == 0) {
+		
+		infstream_init = 1;
+		
+		/* Creo el stream de zlib para descomprimir el buffer leido */
+		infstream.zalloc = Z_NULL;
+		infstream.zfree = Z_NULL;
+		infstream.opaque = Z_NULL;
+		
+		/* Inicializo la descompresion */
+		ret = inflateInit(&infstream);
+		
+		if (ret != Z_OK) {
+			fprintf(stderr, "ERROR --> Cannot initialize Zlib inflate stream.\n");
+			exit(EXIT_FAILURE);
+		}
+	}
+	
+	/* Le asocio el buffer con el stream de datos comprimidos */
+	infstream.avail_in = (uInt)zrle_compressed_len;
+	infstream.next_in = (Bytef *)zrle_compressed_buf;
+	
+	/* Arranco con un buffer de largo 0 (luego lo voy agrandando con cada CHUNK) */
+	char *zrle_buf = malloc(0);
+	unsigned int zrle_len = 0;
+	
+	/* Voy obteniendo el stream descomprimido de a CHUNKS (repito el loop mientras siga obteniendo outs del tamaño del CHUNK) */
+	do {
+		/* Apunto el buffer a donde va a parar la salida del inflate */
+		infstream.avail_out = (uInt)CHUNK;
+		infstream.next_out = (Bytef *)out;
+			
+		/* Descomprimo el stream */
+		ret = inflate(&infstream, Z_NO_FLUSH);
+		assert(ret != Z_STREAM_ERROR);
+		
+		/* Controlo errores */
+		switch (ret) {
+			case Z_NEED_DICT:
+				ret = Z_DATA_ERROR;
+			case Z_DATA_ERROR:
+			case Z_MEM_ERROR:
+				(void)inflateEnd(&infstream);
+				fprintf(stderr, "ERROR --> Cannot inflate Zlib input stream.\n");
+				exit(EXIT_FAILURE);
+		}
+		
+		/* Cantidad de bits obtenidos en la descompresion */
+		have = CHUNK - infstream.avail_out;
+			
+		if (have > 0) {
+						
+			/* Aumento el tamaño del buffer de salida */
+			zrle_buf = realloc(zrle_buf, zrle_len + have);
+			
+			if (zrle_buf == NULL) {
+				(void)inflateEnd(&infstream);
+				fprintf(stderr, "ERROR --> Cannot allocate zrle output buffer.\n");
+				exit(EXIT_FAILURE);
+			}
+			
+			/* Y le copio los bytes obtenidos en el chunk */
+			memcpy(zrle_buf + zrle_len, &out, have);
+			zrle_len += have;
+		}
+		
+	} while (have == CHUNK && ret != Z_STREAM_END);
+	
+	if (verbose > 2) fprintf(stderr, "Mensaje ZRLE descomprimido de %d bytes\n", zrle_len);
+	
+	/* Defino el objeto con que voy a representar el stream descomprimido */
+	ZRLEStream zrle;
+	zrle.pos = zrle_buf;
+	zrle.len = zrle_len;
+	
+	/* Recorro la matriz de rects y proceso los pixeles segun el caso */
+	int i, j;
+	unsigned char subencoding;
+	struct pixel pix;
+	
+	/* The zlibData when uncompressed represents tiles of 64x64 pixels in left-to-right,
+	 * top-to-bottom order, similar to hextile. If the width of the rectangle is not an exact
+	 * multiple of 64 then the width of the last tile in each row is smaller, and if the height of
+	 * the rectangle is not an exact multiple of 64 then the height of each tile in the final row
+	 * is smaller.
+	 */
+	for (i = recty; i < recty + recth; i += 64) {
+		
+		/* Altura del tile. Debería ser 64, salvo el ultimo dentro del rect que podría ser mas chico */
+		int tileh = min(recty + recth - i, 64);
+		
+		for (j = rectx; j < rectx + rectw; j += 64) {
+			
+			/* Ancho del tile. Debería ser 64, salvo el ultimo dentro del rect que podría ser mas chico */
+			int tilew = min(rectx + rectw - j, 64);
+			
+			/* Leo el primer byte del stresm ZRLE que corresponde al subencoding */
+			memcpy(&subencoding, zrle.pos, 1);
+			zrle.pos += 1;
+			zrle.len -= 1;
+			
+			if (verbose > 4) fprintf(stderr, "Procesando tile de '%dx%d' en la posicion '%dx%d' (subencoding = '%d')\n", tilew, tileh, j, i, subencoding);
+			
+			int runLengthEncoded = ((subencoding & 128) != 0) ? 1 : 0;
+			int paletteSize = subencoding & 127;
+			int paletteBuffer[128];
+			
+			/* Leo los datos de la paleta y los cargo en el buffer (la cantidad a leer son los ultimos 7 bits del subencoding) */
+			read_zrle_pixels(&zrle, format, (int*)&paletteBuffer, paletteSize);
+			
+			/* Each tile begins with a subencoding type byte. The top bit of this byte is set if the tile
+			 * has been run-length encoded, clear otherwise. The bottom seven bits indicate the size
+			 * of the palette used - zero means no palette, one means that the tile is of a single colour,
+			 * 2 to 127 indicate a palette of that size
+			 */
+			 
+			/* Segun el valor de subencoding asociado al tile, lo proceso usando un funcion diferente */
+			
+			if (paletteSize == 1) {
+				/* A solid tile consisting of a single colour */
+				int backgroundColor = paletteBuffer[0];
+				create_pixel((uint32_t)backgroundColor, format, &pix);
+				fill_rect(framebuffer, format, &pix, j, i, tilew, tileh);
+				continue;
+			}
+			
+			if (runLengthEncoded == 0) {
+				
+				if (paletteSize == 0) {
+					/* Raw pixel data */
+					read_zrle_raw_pixels(&zrle, format, tilew, tileh);
+				}
+				else {
+					/* Packed palette types */
+					read_zrle_packed_pixels(&zrle, format, tilew, tileh, (int*)&paletteBuffer, paletteSize);
+				}
+			}
+			else if (paletteSize == 0) {
+				/* Plain RLE */
+				read_zrle_plain_rle_pixels(&zrle, format, tilew, tileh);
+			}
+			else {
+				 /* Palette RLE */
+				read_zrle_packed_rle_pixels(&zrle, format, tilew, tileh, (int*)&paletteBuffer);
+			}
+			
+			/* Luego de procesado el tile (segun el caso de subencoding), mando el array de pixeles al framebuffer */
+			handle_updated_zrle_tile(&zrle, format, j, i, tilew, tileh);
+		}
+	}
+	
+	/* Libero la memoria usada por el buffer de datos descomprimidos */
+	free(zrle_buf);
+		
+	if (verbose > 2) fprintf(stderr, "Terminando procesamiento del rect\n");
+}
+
 
 /* hextile encoding is complex enough to get its own function */
-
 static void process_hextile(FBSfile *file, struct FramebufferFormat *format,
 			    int rectx, int recty, int rectw, int recth) {
 
@@ -2313,6 +2821,7 @@ static void process_hextile(FBSfile *file, struct FramebufferFormat *format,
 	}
 }
 
+
 static void process_FramebufferUpdate(FBSfile *file,
 				      struct FramebufferFormat *format)
 {
@@ -2327,9 +2836,8 @@ static void process_FramebufferUpdate(FBSfile *file,
 
 	get_short(file);
 	nrects = get_short(file);
-
-	if (verbose > 2)
-		fprintf(stderr, "Framebuffer update (%d rects)\n", nrects);
+	
+	if (verbose > 2) fprintf(stderr, "Procesando FramebufferUpdate (%d rects)\n", nrects);
 
 	for (rect = 0; rect < nrects; rect ++) {
 
@@ -2338,14 +2846,36 @@ static void process_FramebufferUpdate(FBSfile *file,
 		rectw = get_short(file);
 		recth = get_short(file);
 		type = get_long(file);
-
+		
+		/* Cada vez que voy a procesar un FramebufferUpdate, libero los arrays de pixeles ... */
+		free(zrleTilePixels8);
+		free(zrleTilePixels24);
+		zrleTilePixels8_len = 0;
+		zrleTilePixels24_len = 0;
+		
+		/* ...y los vuelvo a crear con su tamaño correspondiente */
+        if (format->bytes_per_pixel == 1) {
+			zrleTilePixels8 = malloc(sizeof(char) * 4096);
+            zrleTilePixels24 = NULL;
+			zrleTilePixels8_len = 4096;
+			zrleTilePixels24_len = 0;
+        } else {
+            zrleTilePixels8 = NULL;
+			zrleTilePixels24 = malloc(sizeof(int) * 4096);
+			zrleTilePixels8_len = 0;
+			zrleTilePixels24_len = 4096;
+        }
+		
+		if (verbose > 4) fprintf(stderr, "Procesando el rect numero '%i/%i' (type = '%i')\n", rect + 1, nrects, type);
+		
 		if (verbose > 3)
 			fprintf(stderr, "rect %d: (%d,%d) %dx%d type %d\n",
 				rect, rectx, recty, rectw, recth, type);
 
 		switch (type) {
+			
 		case 0:
-			/* raw */
+			/* Raw encoding */
 			for (y = recty; y < recty+recth; y++) {
 				for (x = rectx; x < rectx+rectw; x++) {
 					get_pixel(file, format, &pix);
@@ -2356,7 +2886,7 @@ static void process_FramebufferUpdate(FBSfile *file,
 			break;
 
 		case 1:
-			/* copy rect */
+			/* CopyRect encoding */
 			srcx = get_short(file);
 			srcy = get_short(file);
 			copy_rect(framebuffer, format,
@@ -2364,7 +2894,7 @@ static void process_FramebufferUpdate(FBSfile *file,
 			break;
 
 		case 2:
-			/* RRE */
+			/* RRE encoding */
 			nsubrects = get_long(file);
 			get_pixel(file, format, &pix);
 			fill_rect(framebuffer, format, &pix,
@@ -2383,7 +2913,7 @@ static void process_FramebufferUpdate(FBSfile *file,
 			break;
 
 		case 4:
-			/* CoRRE */
+			/* CoRRE encoding */
 			nsubrects = get_long(file);
 			get_pixel(file, format, &pix);
 			fill_rect(framebuffer, format, &pix,
@@ -2402,12 +2932,17 @@ static void process_FramebufferUpdate(FBSfile *file,
 			break;
 
 		case 5:
-			process_hextile (file, format,
-					 rectx, recty, rectw, recth);
+			/* Hextile encoding */
+			process_hextile(file, format, rectx, recty, rectw, recth);
+			break;
+			
+		case 16:
+			/* ZRLE encoding */
+			process_zrle(file, format, rectx, recty, rectw, recth);
+					 
 			break;
 
 		default:
-
 			/* We don't understand the pixel encoding.
 			 * Maybe we should just bail here, but try to
 			 * keep going.  Skip to next packet, and do an
@@ -2421,7 +2956,6 @@ static void process_FramebufferUpdate(FBSfile *file,
 
 		}
 	}
-
 }
 
 /* export() - called from main() runs through a recorded file (in FBS
@@ -2429,8 +2963,10 @@ static void process_FramebufferUpdate(FBSfile *file,
  * a framerate specified as a fraction (n/m) in frames per second.
  */
 
-static int export (const char *filename, int framerate_n, int framerate_m)
+static int export(const char *filename, int framerate_n, int framerate_m)
 {
+	if (verbose > 2) fprintf(stderr, "Iniciando exportacion de '%s'\n", filename);
+	
 	FBSfile fileptr;
 	struct FramebufferFormat fbfs;
 	struct FramebufferFormat *format = &fbfs;
@@ -2442,8 +2978,7 @@ static int export (const char *filename, int framerate_n, int framerate_m)
 	}
 
 	if (fileptr.minor_version == 0) {
-		fprintf(stderr,	"Warning: "
-			"FBS version 1.0 file with ambiguous pixel format\n");
+		fprintf(stderr,	"Warning: FBS version 1.0 file with ambiguous pixel format\n");
 	}
 
 	if (get_initial_RFB_handshake(&fileptr, format) == -1) {
@@ -2451,18 +2986,27 @@ static int export (const char *filename, int framerate_n, int framerate_m)
 		return -1;
 	}
 
-	framebuffer = (struct pixel *)
-		malloc(format->width * format->height * sizeof(struct pixel));
+	if (verbose > 4) fprintf(stderr, "Se definira framebuffer de %d bytes\n", (int)(format->width * format->height * sizeof(struct pixel)));
+	
+	framebuffer = (struct pixel *)malloc(format->width * format->height * sizeof(struct pixel));
+	
 	if (framebuffer == NULL) {
-		fprintf (stderr,"couldn't malloc framebuffer");
+		fprintf (stderr, "couldn't malloc framebuffer");
 		FBSclose(&fileptr);
 		return -1;
 	}
-
+			
 	while (!fbs_at_eof(&fileptr)) {
 
+		if (verbose > 2) fprintf(stderr, "Procesando nuevo mensaje de tipo '%i'\n", fileptr.buf[0]);
+	
 		switch (fileptr.buf[0]) {
+			
 		case 0:
+			
+			/* FramebufferUpdate */
+			if (verbose > 2) fprintf(stderr, "Caso FramebufferUpdate\n");
+		
 			process_FramebufferUpdate(&fileptr, format);
 
 			/* fileptr.ms has now advanced to the
@@ -2484,7 +3028,7 @@ static int export (const char *filename, int framerate_n, int framerate_m)
 
 			while (1000.0 * (last_frame + 1) * framerate_m
 			       < (double) fileptr.ms * framerate_n) {
-
+				
 				write_framebuffer_as_ppm(NULL, format);
 				last_frame ++;
 				if ((verbose > 0) &&
@@ -2492,15 +3036,17 @@ static int export (const char *filename, int framerate_n, int framerate_m)
 					fprintf(stderr, "Encoded frame %d\n",
 						last_frame);
 			}
-
+			
 			break;
 
 		case 2:
+		
 			/* Bell */
 			get_uchar(&fileptr);
 			break;
 
 		case 3:
+		
 			/* ServerCutText */
 			get_long(&fileptr);
 			length = get_long(&fileptr);
@@ -2520,9 +3066,22 @@ static int export (const char *filename, int framerate_n, int framerate_m)
 			break;
 		}
 	}
-
+	
 	/* Normal return */
 	FBSclose(&fileptr);
+	
+	/* Chequeo si el stream de compresion esta inicializado (caso ZRLE) */
+	if (infstream_init == 1) {
+
+		/* Y finalizo el inflate */
+		int ret = inflateEnd(&infstream);
+		
+		if (ret != Z_OK) {
+			fprintf(stderr, "ERROR --> Cannot finalize Zlib inflate stream.\n");
+			exit(EXIT_FAILURE);
+		}
+	}
+	
 	return 0;
 }
 
